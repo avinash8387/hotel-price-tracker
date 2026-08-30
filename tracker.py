@@ -7,9 +7,12 @@ from email.mime.text import MIMEText
 from playwright.sync_api import sync_playwright
 
 # --- CONFIGURATION ---
-PRICE_THRESHOLD = 1000.0  # Alert when price <= ₹1000
-HOTEL_BASE_URL = "https://www.cleartrip.com/hotels"  # Replace with direct hotel page URL if available
-HOTEL_NAME = "Staayz Premium Hotel & Studio Apartments"  # Replace with your exact target hotel name
+HOTEL_NAME = "SStaayz Premium Hotel & Studio Apartments"  # Explicit Hotel Name for alerts
+PRICE_THRESHOLD = 1500.0             # Alert when price <= ₹1000
+
+# Direct URLs / Property links for your hotel on each platform
+CLEARTRIP_HOTEL_URL = "https://www.cleartrip.com/hotels/details/staayz-premium-hotel-&-studio-apartments-1352800?c=020926%7C040926&r=2%2C0"
+GOIBIBO_HOTEL_URL = "https://www.goibibo.com/hotels/hotel-details/?checkin=20260831&checkout=20260902&roomString=1-2-0&searchText=Staayz%20Premium%20Hotel%20&%20Studio%20Apartments&locusId=CTGGN&locusType=city&cityCode=CTGGN&cc=IN&_uCurrency=INR&vcid=CTGGN&giHotelId=5842278316889170225&mmtId=201603191309599815&sType=city#rooms"
 
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 APP_PASSWORD = os.getenv("APP_PASSWORD")
@@ -36,45 +39,59 @@ def get_next_week_workdays():
     return workdays
 
 
-def fetch_hotel_price(page, check_in, check_out):
-    """Navigates Flipkart Hotels and extracts room rate."""
-    # Example format for Flipkart Hotel search URL (or direct hotel link with query params)
-    url = f"{HOTEL_BASE_URL}?checkin={check_in}&checkout={check_out}&rooms=1&adults=1"
-    page.goto(url, wait_until="networkidle", timeout=60000)
-
-    # Wait for price containers to render
-    page.wait_for_timeout(3000)
-
-    # Scrape visible price text containing rupee sign or price container
-    content = page.content()
-
-    # Regex to capture price patterns like ₹ 899, ₹899, or INR 899
-    matches = re.findall(r"(?:₹|Rs\.?|INR)\s?([0-9,]+)", content)
+def extract_price_from_content(html_content):
+    """Regex helper to extract the lowest realistic rupee amount from page HTML."""
+    matches = re.findall(r"(?:₹|Rs\.?|INR)\s?([0-9,]+)", html_content)
     valid_prices = []
     for m in matches:
         clean_num = m.replace(",", "")
         if clean_num.isdigit():
             val = float(clean_num)
-            if 300 <= val <= 20000:  # Ignore unrelated small numbers/outliers
+            if 300 <= val <= 20000:  # Ignore unrelated counts or outliers
                 valid_prices.append(val)
-
     return min(valid_prices) if valid_prices else None
 
 
+def fetch_cleartrip_price(page, check_in, check_out):
+    """Navigates Cleartrip and extracts room rate."""
+    url = f"{CLEARTRIP_HOTEL_URL}?chk_in={check_in}&chk_out={check_out}&adults=1&num_rooms=1"
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3000)
+        return extract_price_from_content(page.content())
+    except Exception as e:
+        print(f"Cleartrip fetch error ({check_in}): {e}")
+        return None
+
+
+def fetch_goibibo_price(page, check_in, check_out):
+    """Navigates Goibibo and extracts room rate."""
+    cin_compact = check_in.replace("-", "")
+    cout_compact = check_out.replace("-", "")
+    url = f"{GOIBIBO_HOTEL_URL}?ci={cin_compact}&co={cout_compact}&r=1-1-0"
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(3000)
+        return extract_price_from_content(page.content())
+    except Exception as e:
+        print(f"Goibibo fetch error ({check_in}): {e}")
+        return None
+
+
 def send_email_alert(alerts):
-    """Sends notification email via Gmail SMTP."""
+    """Sends notification email via Gmail SMTP with hotel and platform details."""
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🚨 Price Alert: Hotel Dropped Below ₹{int(PRICE_THRESHOLD)}!"
+    msg["Subject"] = f"🚨 {HOTEL_NAME} Price Drop: Deals Below ₹{int(PRICE_THRESHOLD)}!"
     msg["From"] = SENDER_EMAIL
     msg["To"] = RECEIVER_EMAIL
 
-    body_lines = ["<h3>Flipkart Travel Hotel Price Alert</h3><ul>"]
+    body_lines = [f"<h3>Price Alert for {HOTEL_NAME}</h3><ul>"]
     for alert in alerts:
         body_lines.append(
-            f"<li><b>Dates:</b> {alert['check_in']} to {alert['check_out']} — "
-            f"<b>Price:</b> ₹{int(alert['price'])} per day</li>"
+            f"<li><b>Dates:</b> {alert['check_in']} to {alert['check_out']}<br>"
+            f"<b>Lowest Rate:</b> ₹{int(alert['best_price'])} per day on <i>{alert['platform']}</i></li><br>"
         )
-    body_lines.append("</ul><p>Book now on Flipkart Travel before prices fluctuate!</p>")
+    body_lines.append(f"</ul><p>Check the platform app/website to book before prices change!</p>")
 
     msg.attach(MIMEText("".join(body_lines), "html"))
 
@@ -95,20 +112,32 @@ def main():
         page = context.new_page()
 
         for check_in, check_out in workdays:
-            try:
-                price = fetch_hotel_price(page, check_in, check_out)
-                print(f"[{check_in} -> {check_out}] Detected Price: ₹{price}")
+            platform_prices = {}
 
-                if price is not None and price <= PRICE_THRESHOLD:
-                    price_drops.append(
-                        {
-                            "check_in": check_in,
-                            "check_out": check_out,
-                            "price": price,
-                        }
-                    )
-            except Exception as e:
-                print(f"Error fetching {check_in}: {e}")
+            # 1. Fetch Cleartrip
+            ct_price = fetch_cleartrip_price(page, check_in, check_out)
+            if ct_price is not None:
+                platform_prices["Cleartrip"] = ct_price
+
+            # 2. Fetch Goibibo
+            gb_price = fetch_goibibo_price(page, check_in, check_out)
+            if gb_price is not None:
+                platform_prices["Goibibo"] = gb_price
+
+            print(f"[{check_in} -> {check_out}] Scraped rates: {platform_prices}")
+
+            # 3. Find lowest price across platforms and check threshold
+            if platform_prices:
+                best_platform = min(platform_prices, key=platform_prices.get)
+                best_price = platform_prices[best_platform]
+
+                if best_price <= PRICE_THRESHOLD:
+                    price_drops.append({
+                        "check_in": check_in,
+                        "check_out": check_out,
+                        "platform": best_platform,
+                        "best_price": best_price,
+                    })
 
         browser.close()
 
@@ -116,7 +145,7 @@ def main():
         print(f"Triggering email alert for {len(price_drops)} dates...")
         send_email_alert(price_drops)
     else:
-        print("No dates met the price threshold.")
+        print("No dates met the price threshold across either platform.")
 
 
 if __name__ == "__main__":
