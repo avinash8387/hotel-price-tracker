@@ -2,9 +2,8 @@ name: Hotel Price Tracker
 
 on:
   schedule:
-    # Runs every 6 hours (UTC: 00:00, 06:00, 12:00, 18:00)
     - cron: '0 */6 * * *'
-  workflow_dispatch: # Allows manual trigger anytime from GitHub UI
+  workflow_dispatch:
 
 jobs:
   track-prices:
@@ -21,8 +20,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright
-          playwright install chromium --with-deps
+          pip install playwright playwright-stealth
+          playwright install firefox --with-deps
 
       - name: Run Price Tracker
         env:
